@@ -13,8 +13,13 @@ app = FastAPI()
 class qin(BaseModel):
     question : str 
 
+class Source(BaseModel):
+    source: str
+    page: int|str
+
 class qresponse(BaseModel):
-    response : str
+    answer : str
+    sources : list[Source]
 
 
 
@@ -27,10 +32,7 @@ def root():
 
 @app.post('/ask', response_model = qresponse)
 def ask_chatbot(question:qin):
-    answer = user_question(question.question)
-    return {
-        'response' : answer
-    }
+    return user_question(question.question)
     
 
 

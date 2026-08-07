@@ -6,7 +6,6 @@ from langchain_chroma import Chroma
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 
@@ -85,16 +84,25 @@ retriever = vector_db.as_retriever(
     search_kwargs = {'k' : 5}
 )
 
-rag_chain = (
-    {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough(),
-    }
-    | prompt
-    | llm
-    | StrOutputParser()
-)
+answer_chain = prompt | llm | StrOutputParser()
 
 
 def user_question(question : str):
-    return rag_chain.invoke(question)
+    docs = retriever.invoke(question)
+    answer = answer_chain.invoke(
+        {
+            "context": format_docs(docs),
+            "question": question,
+        }
+    )
+    sources = [
+        {
+            "source": doc.metadata.get("source", "Unknown"),
+            "page": doc.metadata.get("page", "Unknown"),
+        }
+        for doc in docs
+    ]
+    return {
+        "answer": answer,
+        "sources": sources,
+    }
