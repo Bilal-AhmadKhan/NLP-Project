@@ -1,58 +1,34 @@
-from langchain.embeddings import Embeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
+"""Retrieval-augmented QA over the Chroma index (built by app.ingest)."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from . import settings
 
 
-load_dotenv()
-
-loader = PyPDFLoader('UGE-Policy.pdf')
-
-documents = loader.load()
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size = 1000,
-    chunk_overlap = 200,
-)
-
-chunks = splitter.split_documents(documents)
-
-embeddings = GoogleGenerativeAIEmbeddings(
-    model= 'models/gemini-embedding-001'
-)
-
-vector_db = Chroma(
-    persist_directory="./chroma_db",
-    collection_name="pdf_documents",
-    embedding_function=embeddings,
-)
-
-if vector_db._collection.count() == 0:
-    vector_db.add_documents(chunks)
-    print("Indexed PDF chunks.")
-else:
-    pass
+class EmptyIndexError(RuntimeError):
+    """Raised when the vector DB has not been built yet."""
 
 
+class LLMError(RuntimeError):
+    """Raised when the OpenRouter call fails (bad key, rate limit, model gone...)."""
 
-llm = ChatGoogleGenerativeAI(
-    model = "gemini-3.5-flash-lite",
-    temperature = 0.1,
-)
 
 prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             """
-You are a question-answering assistant.
+You are a helpful assistant answering questions about FAST-NUCES
+(National University of Computer and Emerging Sciences) programs, campuses,
+admissions, fees, rules and departments.
 
-Answer using only the supplied context.
+Answer using only the supplied context. Be concise and specific; use bullet
+points or a short table when listing courses, fees or criteria.
 If the answer is not contained in the context, say:
 "I do not know based on the provided documents."
 
@@ -70,39 +46,86 @@ Question:
 """,
         ),
     ]
-)   
+)
+
 
 def format_docs(docs):
     return "\n\n".join(
         f"Source: {doc.metadata.get('source', 'Unknown')}\n"
+        f"Title: {doc.metadata.get('title', '')}\n"
         f"Page: {doc.metadata.get('page', 'Unknown')}\n"
         f"Content: {doc.page_content}"
         for doc in docs
     )
 
-retriever = vector_db.as_retriever(
-    search_kwargs = {'k' : 5}
-)
 
-answer_chain = prompt | llm | StrOutputParser()
+@lru_cache(maxsize=1)
+def get_vector_db():
+    warning = settings.embedding_mismatch()
+    if warning:
+        raise settings.ConfigError(warning)
+    return settings.get_vector_db()
 
 
-def user_question(question : str):
-    docs = retriever.invoke(question)
-    answer = answer_chain.invoke(
-        {
-            "context": format_docs(docs),
-            "question": question,
-        }
-    )
-    sources = [
-        {
-            "source": doc.metadata.get("source", "Unknown"),
-            "page": doc.metadata.get("page", "Unknown"),
-        }
-        for doc in docs
+def doc_count() -> int:
+    return get_vector_db()._collection.count()
+
+
+def retrieve(question: str, k: int | None = None):
+    db = get_vector_db()
+    if db._collection.count() == 0:
+        raise EmptyIndexError(
+            "The vector DB is empty. Build it first:\n"
+            "  python -m scraper.fast_scraper --campus lahore --degree cs\n"
+            "  python -m app.ingest"
+        )
+    return db.similarity_search(question, k=k or settings.RETRIEVER_K)
+
+
+def _sources(docs):
+    seen, out = set(), []
+    for doc in docs:
+        key = (doc.metadata.get("source", "Unknown"), doc.metadata.get("page", "Unknown"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "source": key[0],
+            "page": key[1],
+            "title": doc.metadata.get("title") or None,
+        })
+    return out
+
+
+def search(question: str, k: int | None = None):
+    """Retrieval only (no LLM) - handy for debugging the index."""
+    docs = retrieve(question, k)
+    return [
+        {"content": d.page_content, **{m: d.metadata.get(m) for m in ("source", "title", "page", "campus", "degree")}}
+        for d in docs
     ]
+
+
+def user_question(question: str):
+    docs = retrieve(question)
+    answer_chain = prompt | settings.get_llm() | StrOutputParser()
+    try:
+        answer = answer_chain.invoke(
+            {
+                "context": format_docs(docs),
+                "question": question,
+            }
+        )
+    except Exception as exc:  # openai.APIError subclasses, network errors, ...
+        status = getattr(exc, "status_code", None)
+        hint = {
+            401: "check OPENROUTER_API_KEY in .env",
+            402: "this model needs credits - pick a ':free' model",
+            404: f"model '{settings.OPENROUTER_MODEL}' not found - set another OPENROUTER_MODEL",
+            429: "free-tier rate limit hit - wait a bit or switch OPENROUTER_MODEL",
+        }.get(status, "see the server log for details")
+        raise LLMError(f"OpenRouter request failed ({status or type(exc).__name__}): {hint}. {exc}") from exc
     return {
-        "answer": answer,
-        "sources": sources,
+        "answer": answer.strip(),
+        "sources": _sources(docs),
     }
